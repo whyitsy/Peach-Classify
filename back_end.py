@@ -1,0 +1,166 @@
+import io, os, sys, types
+from IPython import get_ipython
+from nbformat import read
+from IPython.core.interactiveshell import InteractiveShell
+import torch
+def find_notebook(fullname, path=None):
+    """find a notebook, given its fully qualified name and an optional path
+    
+    This turns "foo.bar" into "foo/bar.ipynb"
+    and tries turning "Foo_Bar" into "Foo Bar" if Foo_Bar
+    does not exist.
+    """
+    name = fullname.rsplit('.', 1)[-1]
+    if not path:
+        path = ['']
+    for d in path:
+        nb_path = os.path.join(d, name + ".ipynb")
+        if os.path.isfile(nb_path):
+            return nb_path
+        # let import Notebook_Name find "Notebook Name.ipynb"
+        nb_path = nb_path.replace("_", " ")
+        if os.path.isfile(nb_path):
+            return nb_path
+        
+class NotebookLoader(object):
+    """Module Loader for Jupyter Notebooks"""
+    def __init__(self, path=None):
+        self.shell = InteractiveShell.instance()
+        self.path = path
+    
+    def load_module(self, fullname):
+        """import a notebook as a module"""
+        path = find_notebook(fullname, self.path)
+        
+        print ("importing Jupyter notebook from %s" % path)
+                                       
+        # load the notebook object
+        with io.open(path, 'r', encoding='utf-8') as f:
+            nb = read(f, 4)
+        
+        
+        # create the module and add it to sys.modules
+        # if name in sys.modules:
+        #    return sys.modules[name]
+        mod = types.ModuleType(fullname)
+        mod.__file__ = path
+        mod.__loader__ = self
+        mod.__dict__['get_ipython'] = get_ipython
+        sys.modules[fullname] = mod
+        
+        # extra work to ensure that magics that would affect the user_ns
+        # actually affect the notebook module's ns
+        save_user_ns = self.shell.user_ns
+        self.shell.user_ns = mod.__dict__
+        
+        try:
+          for cell in nb.cells:
+            if cell.cell_type == 'code':
+                # transform the input to executable Python
+                code = self.shell.input_transformer_manager.transform_cell(cell.source)
+                # run the code in themodule
+                exec(code, mod.__dict__)
+        finally:
+            self.shell.user_ns = save_user_ns
+        return mod
+class NotebookFinder(object):
+    """Module finder that locates Jupyter Notebooks"""
+    def __init__(self):
+        self.loaders = {}
+    
+    def find_module(self, fullname, path=None):
+        nb_path = find_notebook(fullname, path)
+        if not nb_path:
+            return
+        
+        key = path
+        if path:
+            # lists aren't hashable
+            key = os.path.sep.join(path)
+        
+        if key not in self.loaders:
+            self.loaders[key] = NotebookLoader(path)
+        return self.loaders[key]
+
+sys.meta_path.append(NotebookFinder())
+# 导入库
+from flask import Flask, request
+from flask_cors import CORS
+import glob
+from queue import Queue
+import sys
+from mobilenetV3.model_v3 import mobilenet_v3_large
+import os
+import threading
+from PIL import Image
+from io import BytesIO
+import json
+import numpy as np
+import cv2
+# 定义消息队列
+picture_recognized = Queue(5)
+recognized_result = Queue(5)
+# 预测函数
+def object_classify():
+    global picture_recognized
+    global recognized_result
+    class_indict = {}
+    num_classes = 0
+    # read class_indict
+    json_path = './class_indices.json'
+    assert os.path.exists(json_path), "file: '{}' dose not exist.".format(json_path)    # 确保class_indices.json存在
+    with open(json_path, "r") as fd_js: # 读class_indices.json,从中获取标签信息class_indict和标签数量num_classes
+        class_indict = json.load(fd_js) # json转为python对象
+        num_classes = len(class_indict.keys())  # 获得标签个数
+    # 加载MobileNetV3模型
+    model = mobilenet_v3_large(num_classes=num_classes)   # 根据标签数量构造mobilenet_v3_large模型
+    weights_path = 'save_weights/MobileNetV3_0.8870.pth'
+    assert len(glob.glob(weights_path + "*")), "cannot find {}".format(weights_path)    # 确保resMobileNetV3.ckpt*的文件存在
+    # model.load_weights(weights_path)    # 对当前模型model加载权重
+    model.load_state_dict(torch.load(weights_path, map_location='cpu'))
+    while True:
+        classify_img = picture_recognized.get()    # 获得要分类的图像(没数据的时候阻塞)
+        with torch.no_grad():
+            # predict class
+            output = torch.squeeze(model(classify_img)).cpu()
+            predict = torch.softmax(output, dim=0)
+            predict_cla = torch.argmax(predict)
+            print(output)
+            recognized_result.put([{"label": class_indict[str(predict_cla)], "confidence": output[predict_cla]}])
+
+if __name__ == "__main__":
+    im_height = 224
+    im_width = 224
+    # 开启预测函数的线程t_object_classify
+    t_object_classify = threading.Thread(target=object_classify)
+    t_object_classify.start()
+    # 完成后端
+    app = Flask(__name__)
+    """
+    跨域的作用:
+    前端能够直接访问它的后端,但其他后端不能直接访问某一特定后端,这个时候就需要跨域技术来使其他后端能够直接访问这个特定的后端
+    (BS架构(B浏览器S服务器)需要后端访问后端)
+    """
+    CORS(app, supports_credentials=True)    # 支持跨域
+    @app.route("/aisim_tf_pre", methods=["POST"])  # 指定路由(POST:访问方式)
+    def get_picture_post_result():
+        global picture_recognized
+        global recognized_result
+        upload = request.get_data() # 获得原始数据
+        if upload:
+            try:
+                byte_stream = BytesIO(upload)   # 将获得数据放入到内存中
+                img = Image.open(byte_stream)   # 使用上述内存获得相应的Image对象
+                img = img.resize((im_width, im_height)) # 将图像缩放成im_width * im_height
+                img_np_bgr = np.asarray(img)  # Image对象转numpy数组(注意:转完之后就是bgra图了)
+                # img_np_bgr = cv2.cvtColor(img_np_bgr, cv2.COLOR_BGRA2BGR)  # 将BGRA转为BGR数组
+                img = img_np_bgr.astype(np.float32)  # 将数组中元素的数据类型转为float32
+                img = ((img / 255.) - 0.5) * 2.0    # 将像素值缩放到(-1, 1)
+                img = (np.expand_dims(img, 0))  # 将图像添加到一批中(在这批中只有该图像)
+                picture_recognized.put(img)  # 将要识别的图像(bgr)塞入到队列picture_recognized中
+                res = json.dumps({"results": recognized_result.get()})  # 以阻塞方式获得识别结果,并将识别结果转为json
+            except Exception as e:
+                return json.dumps({"results": [], "error": e})  # 有异常,就返回代表错误的json
+            return res  # 返回含有识别结果的json
+    # app.run(host="0.0.0.0", port=8088, debug=False, ssl_context=("./www.ws2wss.com+3.pem", "./www.ws2wss.com+3-key.pem")) # 类似于开了一个线程
+    app.run(host="0.0.0.0", port=8088, debug=False) # 类似于开了一个线程

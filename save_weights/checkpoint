@@ -1,0 +1,2 @@
+model_checkpoint_path: "resMobileNetV3.ckpt"
+all_model_checkpoint_paths: "resMobileNetV3.ckpt"
